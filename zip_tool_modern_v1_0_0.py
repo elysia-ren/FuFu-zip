@@ -1033,6 +1033,32 @@ def main():
         print("错误: Tkinter不可用，请安装包含Tkinter的Python版本")
         return
 
+    # ============================================================
+    # 检查是否使用占位密钥（安全性拦截）
+    # ============================================================
+    try:
+        # 用临时对象检测，不触发正常初始化
+        pm = _PyPasswordManager()
+        enc = _PyFileNameEncryptor()
+        if pm.password_seed == 0 or enc.master_password == "YOUR_SECRET_KEY_HERE":
+            if tk_available:
+                _root = tk.Tk()
+                _root.withdraw()
+                messagebox.showerror(
+                    "安全配置错误",
+                    "程序尚未配置安全密钥，无法运行。\n"
+                    "请创建 secret_config.py 并填入您自己的种子和密码。\n"
+                    "详情请参考源码说明。"
+                )
+                _root.destroy()
+            else:
+                print("错误：占位密钥未替换，请配置 secret_config.py")
+            sys.exit(1)
+    except Exception:
+        # 如果检测过程出错，为避免误伤，允许继续运行（但可能后续出错）
+        pass
+    # ============================================================
+
     root = tk.Tk()
     app = ModernMainWindow(root)
     try:

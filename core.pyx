@@ -47,6 +47,12 @@ cdef class PasswordManager:
             + "!@#$%^&*()_+-=[]{}|;:,.<>?"
         )
         cdef int seed = 0  # TODO: 替换为你自己的种子
+
+        # ---- 占位值检测 ----
+        if seed == 0:
+            raise RuntimeError("核心模块未配置安全密钥，请替换占位种子后重新编译。")
+        # -------------------
+
         cdef int count = 100
         cdef int length = 50
         cdef int i
@@ -85,6 +91,12 @@ cdef class FileNameEncryptor:
         # ---- 敏感参数：编译后以二进制形式存在 ----
         cdef str master_pw = "YOUR_SECRET_KEY_HERE"  # TODO: 替换
         cdef bytes salt = b"YOUR_SECRET_SALT_HERE"  # TODO: 替换
+
+        # ---- 占位值检测 ----
+        if master_pw == "YOUR_SECRET_KEY_HERE" or salt == b"YOUR_SECRET_SALT_HERE":
+            raise RuntimeError("核心模块未配置安全密钥，请替换占位密码和盐后重新编译。")
+        # -------------------
+
         cdef int iterations = 100000
         cdef int key_size = 32
 
