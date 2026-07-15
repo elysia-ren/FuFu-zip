@@ -2,19 +2,7 @@
 # cython: language_level=3
 """
 SecureZip Pro 核心安全模块 (Cython编译版)
-
-此文件用Cython编译为 .pyd/.so 后，主程序 import core 即可使用。
-编译后的二进制无法被 pyinstxtractor + uncompyle6 反编译，
-极大提高了密码字典种子和AES密钥的保护强度。
-
-编译方法：
-    pip install cython setuptools
-    python build_core.py build_ext --inplace
-
-注意：
-    - 类名必须与主程序中的 fallback 类一致（PasswordManager / FileNameEncryptor）
-    - 编译后将 core.pyd (Windows) 或 core.so (Linux) 放在主程序同目录
-    - PyInstaller 打包时需将 core.pyd/core.so 包含进去
+...
 """
 
 import os
@@ -31,7 +19,6 @@ from Crypto.Random import get_random_bytes
 cdef class PasswordManager:
     """
     密码字典生成器（Cython编译保护）
-
     种子和字符集编译为二进制后，常规反编译工具无法直接读取。
     """
 
@@ -39,14 +26,14 @@ cdef class PasswordManager:
     cdef int _count
 
     def __init__(self):
-        # ---- 敏感参数：编译后以二进制形式存在 ----
         cdef str chars = (
             string.ascii_uppercase
             + string.ascii_lowercase
             + string.digits
             + "!@#$%^&*()_+-=[]{}|;:,.<>?"
         )
-        cdef int seed = 0  # TODO: 替换为你自己的种子
+        # 使用普通 Python 整数，避免 C 编译器 int 大小限制
+        seed = 0  # 占位值，请替换为自己的随机种子（推荐 9~12 位整数）
 
         # ---- 占位值检测 ----
         if seed == 0:
@@ -76,10 +63,6 @@ cdef class PasswordManager:
 cdef class FileNameEncryptor:
     """
     文件名全名加密器（含扩展名，Cython编译保护）
-
-    加密格式：ZENC(4B) + 原始文件名 → PKCS7填充 → AES-256-CBC加密
-    输出格式：Base64(IV + 密文) → 替换不安全字符 → .enc后缀
-
     密钥通过PBKDF2从主密码派生，编译后主密码以二进制形式存在。
     """
 
@@ -89,8 +72,8 @@ cdef class FileNameEncryptor:
 
     def __init__(self):
         # ---- 敏感参数：编译后以二进制形式存在 ----
-        cdef str master_pw = "YOUR_SECRET_KEY_HERE"  # TODO: 替换
-        cdef bytes salt = b"YOUR_SECRET_SALT_HERE"  # TODO: 替换
+        master_pw = "YOUR_SECRET_KEY_HERE"       # 占位值，请替换为强密码
+        salt = b"YOUR_SECRET_SALT_HERE"          # 占位值，请替换为随机字节序列
 
         # ---- 占位值检测 ----
         if master_pw == "YOUR_SECRET_KEY_HERE" or salt == b"YOUR_SECRET_SALT_HERE":
@@ -111,10 +94,11 @@ cdef class FileNameEncryptor:
     cdef bytes _unpad(self, bytes data):
         if not data:
             return data
-        cdef int p = data[len(data)-1]
+        cdef int length = len(data)
+        cdef int p = data[length - 1]          # 正索引替换 data[-1]
         if p < 1 or p > self._block_size:
             raise ValueError("无效的填充")
-        return data[:len(data)-p]
+        return data[:length - p]               # 正索引替换 data[:-p]
 
     def encrypt_filename(self, str original_filename):
         """
