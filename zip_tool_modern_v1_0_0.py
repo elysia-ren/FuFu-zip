@@ -50,7 +50,7 @@ logger = SilentLogger()
 class _PyPasswordManager:
     def __init__(self):
         self.chars = string.ascii_uppercase + string.ascii_lowercase + string.digits + "!@#$%^&*()_+-=[]{}|;:,.<>?"
-        self.password_seed = 293132843413430611711722818101810311111127
+        self.password_seed = 0
         self.password_count = 100
         self.passwords = self._generate_all()
 
@@ -77,8 +77,8 @@ class _PyFileNameEncryptor:
     MAGIC = b"ZENC"
     def __init__(self):
         self.encryption_key = _PBKDF2(
-            "builtin_file_encryption_key_2025_v9",
-            b"fixed_salt_for_file_encryption_2025",
+            "YOUR_SECRET_KEY_HERE",
+            b"fYOUR_SECRET_SALT_HERE",
             dkLen=32, count=1111)
         self.block_size = 16
 
