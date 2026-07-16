@@ -1,101 +1,67 @@
 # -*- coding: utf-8 -*-
 """
-文件压缩解压工具 - 安全增强版 (v1.0.0)
-- ZENC魔数 + .enc统一后缀，完整隐藏文件类型
-- 移除cp437编码，直接使用UTF-8 Base64安全文件名
-- 子线程UI更新通过root.after调度到主线程
-- 可选Cython编译核心模块防反编译
-- 启动时依赖检查，友好错误提示
+FuFu-zip v1.1.0
+- 批量解压 · 拖拽 · 取消
+- 浅色/深色/随系统主题
 """
 
 import os
-import random
-import string
+import sys
 import time
 import threading
-import sys
-import ctypes
-import traceback
-import platform
+import string
+import json
 import base64
 import hashlib
-
-# ============================================================
-# 依赖检查
-# ============================================================
-_missing_deps = []
-
-try:
-    import pyzipper
-except ImportError:
-    _missing_deps.append(("pyzipper", "pip install pyzipper"))
-
-try:
-    from Crypto.Cipher import AES
-    from Crypto.Protocol.KDF import PBKDF2
-    from Crypto.Random import get_random_bytes
-except ImportError:
-    _missing_deps.append(("pycryptodome", "pip install pycryptodome"))
+import random
+import pyzipper
+from Cryptodome.Cipher import AES
+from Cryptodome.Protocol.KDF import PBKDF2
+from Cryptodome.Random import get_random_bytes
 
 try:
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox, scrolledtext
-    from tkinter.ttk import Style
     tk_available = True
 except ImportError:
     tk_available = False
-    _missing_deps.append(("tkinter", "请安装包含Tkinter的Python版本"))
 
-# 依赖检查结果保存，main()启动时再判断是否退出
-# 允许 import 时不退出（测试脚本可跳过tkinter）
+_pyzipper = pyzipper
+_AES = AES
+_PBKDF2 = PBKDF2
+_get_random_bytes = get_random_bytes
+_base64 = base64
+_hashlib = hashlib
+_random_mod = random
 
-# ============================================================
-# 尝试导入 Cython 编译的核心模块（优先使用二进制版本）
-# ============================================================
-_use_cython_core = False
-try:
-    import core as _cython_core
-    _use_cython_core = True
-except ImportError:
-    pass
-
-# ============================================================
-# 日志器
-# ============================================================
 class SilentLogger:
-    """静默日志器 - 只输出到控制台"""
-    def log(self, message, level="INFO"):
+    def log(self, msg, level="INFO"):
         try:
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{timestamp}] [{level}] {message}")
-        except:
+            print(f"[{time.strftime('%H:%M:%S')}] [{level}] {msg}")
+        except Exception:
             pass
 
 logger = SilentLogger()
 
+
 # ============================================================
-# 密码管理器（内置纯Python实现，作为Cython模块的fallback）
+# 密码 / 文件名加密
 # ============================================================
 class _PyPasswordManager:
-    """
-    密码字典生成器
-    注意：此类的Cython编译版本位于 core.pyx，安全性更高。
-    当 core 可用时自动使用编译版本。
-    """
     def __init__(self):
         self.chars = string.ascii_uppercase + string.ascii_lowercase + string.digits + "!@#$%^&*()_+-=[]{}|;:,.<>?"
-        self.password_seed = 0  # TODO: 替换为你自己的种子
+        self.password_seed = 293132843413430611711722818101810311111127
         self.password_count = 100
         self.passwords = self._generate_all()
 
     def _generate_one(self, length=50, index=0):
         try:
-            random.seed(self.password_seed + index)
-            pw = ''.join(random.choice(self.chars) for _ in range(length))
-            random.seed()
+            _random_mod.seed(self.password_seed + index)
+            pw = ''.join(_random_mod.choice(self.chars) for _ in range(length))
+            _random_mod.seed()
             return pw
-        except:
-            return "fallback_" + str(index).zfill(3) + "_" + "x" * 40
+        except (ValueError, TypeError, OverflowError):
+            return _hashlib.sha256(f"{self.password_seed}_{index}".encode()).hexdigest()[:length]
 
     def _generate_all(self):
         return [self._generate_one(index=i) for i in range(self.password_count)]
@@ -106,965 +72,940 @@ class _PyPasswordManager:
     def get_password_count(self):
         return self.password_count
 
-# ============================================================
-# 文件名加密器（内置纯Python实现，作为Cython模块的fallback）
-# ============================================================
+
 class _PyFileNameEncryptor:
-    """
-    文件名全名加密器（含扩展名）
-    - 加密输入：完整文件名UTF-8字节
-    - 密文格式：ZENC(4B) + IV(16B) + AES-CBC密文 → Base64 → .enc后缀
-    - 解密校验：ZENC魔数验证，非本程序加密的文件直接跳过
-
-    注意：此类的Cython编译版本位于 core.pyx，安全性更高。
-    当 core 可用时自动使用编译版本。
-    """
-    MAGIC = b"ZENC"  # 4字节魔数
-
+    MAGIC = b"ZENC"
     def __init__(self):
-        self.master_password = "YOUR_SECRET_KEY_HERE"  # TODO: 替换
-        self.salt = b"YOUR_SECRET_SALT_HERE"  # TODO: 替换
-        self.iterations = 100000
-        self.key_size = 32
+        self.encryption_key = _PBKDF2(
+            "builtin_file_encryption_key_2025_v9",
+            b"fixed_salt_for_file_encryption_2025",
+            dkLen=32, count=1111)
         self.block_size = 16
-        self.encryption_key = PBKDF2(self.master_password, self.salt,
-                                     dkLen=self.key_size, count=self.iterations)
 
-    def _pad(self, data):
-        padding = self.block_size - len(data) % self.block_size
-        return data + bytes([padding] * padding)
+    def _pad(self, d):
+        p = self.block_size - len(d) % self.block_size
+        return d + bytes([p] * p)
 
-    def _unpad(self, data):
-        if not data:
-            return data
-        padding = data[-1]
-        if padding < 1 or padding > self.block_size:
-            raise ValueError("无效的填充")
-        return data[:-padding]
+    def _unpad(self, d):
+        if not d: return d
+        p = d[-1]
+        if p < 1 or p > self.block_size: raise ValueError("无效填充")
+        if d[-p:] != bytes([p] * p): raise ValueError("无效填充")
+        return d[:-p]
 
-    def encrypt_filename(self, original_filename):
-        """
-        加密完整文件名（含扩展名）
-        返回：Base64字符串.enc（如 'aBcDeFgH...xYz.enc'）
-        """
+    def encrypt_filename(self, name):
         try:
-            data = original_filename.encode('utf-8')
-            # 魔数 + 原始文件名
-            payload = self.MAGIC + data
-            payload = self._pad(payload)
+            payload = self._pad(self.MAGIC + name.encode('utf-8'))
+            iv = _get_random_bytes(self.block_size)
+            ct = _AES.new(self.encryption_key, _AES.MODE_CBC, iv).encrypt(payload)
+            b64 = _base64.b64encode(iv + ct).decode('ascii')
+            return b64.replace('/', '_').replace('+', '-').replace('=', '') + ".enc"
+        except Exception:
+            return f"fallback_{_hashlib.sha256(name.encode()).hexdigest()[:16]}.enc"
 
-            iv = get_random_bytes(self.block_size)
-            cipher = AES.new(self.encryption_key, AES.MODE_CBC, iv)
-            encrypted = cipher.encrypt(payload)
-
-            combined = iv + encrypted
-            b64 = base64.b64encode(combined).decode('ascii')
-            # 替换URL不安全字符，确保ZIP文件名兼容
-            safe = b64.replace('/', '_').replace('+', '-').replace('=', '')
-            return safe + ".enc"
-        except Exception as e:
-            logger.log(f"文件名加密失败: {e}", "ERROR")
-            # fallback: 用SHA256哈希
-            h = hashlib.sha256(original_filename.encode('utf-8')).hexdigest()[:16]
-            return f"fallback_{h}.enc"
-
-    def decrypt_filename(self, encrypted_filename):
-        """
-        解密文件名
-        输入：Base64字符串.enc
-        返回：原始完整文件名（含扩展名）
-        """
+    def decrypt_filename(self, enc_name):
         try:
-            name = encrypted_filename
-            # 去掉.enc后缀
-            if name.endswith('.enc'):
-                name = name[:-4]
-            else:
-                # 不是.enc文件，原样返回
-                return encrypted_filename
+            if not enc_name.endswith('.enc'): return enc_name
+            s = enc_name[:-4].replace('_', '/').replace('-', '+')
+            s += '=' * (-len(s) % 4)
+            raw = _base64.b64decode(s)
+            if len(raw) < self.block_size * 2: return enc_name
+            iv, ct = raw[:self.block_size], raw[self.block_size:]
+            pt = self._unpad(_AES.new(self.encryption_key, _AES.MODE_CBC, iv).decrypt(ct))
+            if pt[:4] != self.MAGIC: return enc_name
+            return pt[4:].decode('utf-8')
+        except Exception:
+            return enc_name
 
-            # 恢复Base64字符
-            name = name.replace('_', '/').replace('-', '+')
-            # 补齐padding
-            pad_needed = len(name) % 4
-            if pad_needed:
-                name += '=' * (4 - pad_needed)
 
-            decoded = base64.b64decode(name)
+_use_cython_core = False
+try:
+    import core as _cython_core; _use_cython_core = True
+except ImportError:
+    pass
 
-            # 至少需要 IV(16) + 最小密文(16) + 魔数(4) + 填充
-            if len(decoded) < self.block_size * 2:
-                return encrypted_filename
-
-            iv = decoded[:self.block_size]
-            encrypted = decoded[self.block_size:]
-
-            cipher = AES.new(self.encryption_key, AES.MODE_CBC, iv)
-            decrypted = cipher.decrypt(encrypted)
-            unpadded = self._unpad(decrypted)
-
-            # 校验ZENC魔数
-            if unpadded[:4] != self.MAGIC:
-                # 非本程序加密的文件，原样返回
-                return encrypted_filename
-
-            original = unpadded[4:].decode('utf-8')
-            return original
-        except Exception as e:
-            logger.log(f"文件名解密失败: {e}", "ERROR")
-            return encrypted_filename
-
-# ============================================================
-# 统一接口：优先Cython，fallback纯Python
-# ============================================================
 def _create_password_manager():
     if _use_cython_core and hasattr(_cython_core, 'PasswordManager'):
-        logger.log("使用Cython编译的核心模块(PasswordManager)")
         return _cython_core.PasswordManager()
-    logger.log("使用内置纯Python密码管理器")
     return _PyPasswordManager()
 
 def _create_filename_encryptor():
     if _use_cython_core and hasattr(_cython_core, 'FileNameEncryptor'):
-        logger.log("使用Cython编译的核心模块(FileNameEncryptor)")
         return _cython_core.FileNameEncryptor()
-    logger.log("使用内置纯Python文件名加密器")
     return _PyFileNameEncryptor()
 
+
 # ============================================================
-# 安全压缩解压处理器
+# 压缩解压处理器
 # ============================================================
 class SecureZipHandler:
-    """安全压缩解压处理器"""
-    def __init__(self, password_manager):
-        self.password_manager = password_manager
+    def __init__(self, pm):
+        self.password_manager = pm
         self.last_password = None
         self.filename_encryptor = _create_filename_encryptor()
         self.current_zip_password = None
 
     def safe_encode(self, text):
-        """安全编码文本"""
-        if not isinstance(text, str):
-            text = str(text)
+        if not isinstance(text, str): text = str(text)
         for enc in ('utf-8', 'gbk', 'latin-1'):
-            try:
-                return text.encode(enc)
-            except:
-                continue
+            try: return text.encode(enc)
+            except Exception: continue
         return text.encode('utf-8', 'replace')
 
-    def compress_files(self, source_paths, output_path, progress_callback=None):
-        """
-        压缩文件
-        - 文件名经加密后为纯ASCII Base64字符串 + .enc后缀
-        - pyzipper自动以UTF-8存储，无需手动cp437编码
-        - ZIP内容使用AES-256加密
-        """
-        for path in source_paths:
-            if not os.path.exists(path):
-                return False, "源文件不存在: " + str(path)
-
-        output_dir = os.path.dirname(output_path)
-        if output_dir and not os.path.exists(output_dir):
-            try:
-                os.makedirs(output_dir)
-            except Exception as e:
-                return False, "创建输出目录失败: " + str(e)
-
-        passwords = self.password_manager.get_passwords()
-        if passwords:
-            password = random.choice(passwords)
-            self.current_zip_password = password
-            self.last_password = password
-        else:
-            password = "default_password_fallback"
-            self.current_zip_password = password
-
+    def compress_files(self, sources, output, progress_cb=None, cancel_check=None):
+        for p in sources:
+            if not os.path.exists(p): return False, "源文件不存在: " + p, None
+        out_dir = os.path.dirname(output)
+        if out_dir and not os.path.exists(out_dir):
+            try: os.makedirs(out_dir)
+            except Exception as e: return False, "创建目录失败: " + str(e), None
+        pws = self.password_manager.get_passwords()
+        pw = _random_mod.choice(pws) if pws else "default_password_fallback"
+        self.current_zip_password = self.last_password = pw
         try:
-            with pyzipper.AESZipFile(output_path, 'w',
-                                     compression=pyzipper.ZIP_DEFLATED,
-                                     encryption=pyzipper.WZ_AES) as zipf:
-                zipf.setpassword(self.safe_encode(password))
-
-                # 计算总文件数
-                total_files = 0
-                for path in source_paths:
-                    if os.path.isfile(path):
-                        total_files += 1
+            with _pyzipper.AESZipFile(output, 'w',
+                                      compression=_pyzipper.ZIP_DEFLATED,
+                                      encryption=_pyzipper.WZ_AES) as zf:
+                zf.setpassword(self.safe_encode(pw))
+                total = processed = 0
+                for src in sources:
+                    if os.path.isfile(src): total += 1
                     else:
-                        for root, dirs, files in os.walk(path):
-                            total_files += len(files)
-
-                processed = 0
-                for path in source_paths:
-                    if os.path.isfile(path):
-                        # 加密完整文件名（含扩展名）
-                        arcname = self.filename_encryptor.encrypt_filename(
-                            os.path.basename(path))
-                        zipf.write(path, arcname=arcname)
-                        processed += 1
-                        if progress_callback:
-                            progress_callback(int(processed / total_files * 100))
+                        for r, ds, fs in os.walk(src): total += len(fs)
+                last_ts = [0]
+                def _prog(v):
+                    now = time.monotonic()
+                    if now - last_ts[0] < 0.1 and v < 100: return
+                    last_ts[0] = now
+                    if progress_cb: progress_cb(v)
+                for src in sources:
+                    if os.path.isfile(src):
+                        if cancel_check and cancel_check(): return False, "操作已取消", None
+                        zf.write(src, arcname=self.filename_encryptor.encrypt_filename(os.path.basename(src)))
+                        processed += 1; _prog(int(processed / total * 100))
+                        if processed % 10 == 0: time.sleep(0)  # 让出GIL，防止UI卡死
                     else:
-                        base_name = os.path.basename(path)
-                        for root, dirs, files in os.walk(path):
-                            rel_path = os.path.relpath(root, path)
-                            for file in files:
-                                file_path = os.path.join(root, file)
-                                if rel_path == '.':
-                                    original_filename = os.path.join(base_name, file)
-                                else:
-                                    original_filename = os.path.join(base_name, rel_path, file)
-                                # 加密完整相对路径
-                                arcname = self.filename_encryptor.encrypt_filename(
-                                    original_filename)
-                                zipf.write(file_path, arcname=arcname)
-                                processed += 1
-                                if progress_callback:
-                                    progress_callback(int(processed / total_files * 100))
+                        base = os.path.basename(src)
+                        for root, dirs, files in os.walk(src):
+                            rel = os.path.relpath(root, src)
+                            for f in files:
+                                if cancel_check and cancel_check(): return False, "操作已取消", None
+                                fp = os.path.join(root, f)
+                                orig = os.path.join(base, f) if rel == '.' else os.path.join(base, rel, f)
+                                zf.write(fp, arcname=self.filename_encryptor.encrypt_filename(orig))
+                                processed += 1; _prog(int(processed / total * 100))
+                                if processed % 10 == 0: time.sleep(0)  # 让出GIL，防止UI卡死
+                return True, "压缩成功，文件名已加密", pw
+        except PermissionError as e: return False, "权限不足: " + str(e), None
+        except Exception as e: return False, "压缩失败: " + str(e), None
 
-                logger.log(f"压缩完成: {output_path}")
-                return True, "压缩成功，文件名已加密", password
-
-        except PermissionError as e:
-            return False, "权限不足: " + str(e)
-        except Exception as e:
-            logger.log(f"压缩失败: {e}", "ERROR")
-            return False, "压缩失败: " + str(e)
-
-    def decompress_file(self, zip_path, output_dir, progress_callback=None):
-        """
-        解压文件
-        - 先逐个密码尝试读取第一个文件来验证密码
-        - 密码匹配后再集中解压全部文件（进度条仅覆盖解压阶段）
-        - 文件名通过ZENC魔数校验后解密
-        - 非本程序加密的文件保持原名不解密
-        """
-        if not os.path.exists(zip_path):
-            return False, "ZIP文件不存在"
-
-        if not os.path.exists(output_dir):
-            try:
-                os.makedirs(output_dir)
-            except Exception as e:
-                return False, "创建输出目录失败: " + str(e)
-
+    def decompress_file(self, zip_path, out_dir, progress_cb=None, cancel_check=None):
+        if not os.path.exists(zip_path): return False, "ZIP文件不存在", None
+        if not os.path.exists(out_dir):
+            try: os.makedirs(out_dir)
+            except Exception as e: return False, "创建目录失败: " + str(e), None
         try:
-            # 读取文件列表
             try:
-                with pyzipper.AESZipFile(zip_path, 'r') as zipf:
-                    file_list = zipf.infolist()
-                    file_count = len(file_list)
-                    logger.log(f"ZIP包含 {file_count} 个文件")
-            except Exception as e:
-                return False, "无效的ZIP文件: " + str(e)
-
-            if file_count == 0:
-                return True, "ZIP文件为空", None
-
-            passwords = self.password_manager.get_passwords()
-            total_passwords = len(passwords)
-
-            # ---- 阶段1：验证密码（读取第一个文件的一个字节） ----
-            matched_password = None
-            for i, password in enumerate(passwords):
+                with _pyzipper.AESZipFile(zip_path, 'r') as zf:
+                    flist = zf.infolist(); fcount = len(flist)
+            except Exception as e: return False, "无效ZIP: " + str(e), None
+            if fcount == 0: return True, "ZIP为空", None
+            pws = self.password_manager.get_passwords()
+            matched = None
+            for i, pw in enumerate(pws):
+                if cancel_check and cancel_check(): return False, "操作已取消", None
                 try:
-                    with pyzipper.AESZipFile(zip_path, 'r') as zipf:
-                        zipf.setpassword(self.safe_encode(password))
-                        with zipf.open(file_list[0]) as f:
-                            f.read(1)  # 读1字节验证密码
-                    matched_password = password
-                    logger.log(f"密码 #{i+1} 验证成功")
-                    break
+                    with _pyzipper.AESZipFile(zip_path, 'r') as zf:
+                        zf.setpassword(self.safe_encode(pw))
+                        with zf.open(flist[0]) as f: f.read(1)
+                    matched = pw; break
                 except RuntimeError as e:
                     err = str(e).lower()
-                    if "password" in err or "incorrect" in err:
-                        continue
-                    else:
-                        logger.log(f"运行时错误: {e}", "ERROR")
-                except Exception as e:
-                    logger.log(f"尝试密码 #{i+1} 出错: {e}", "ERROR")
-
-            if matched_password is None:
-                return False, "解压失败，密码不在内置字典中", None
-
-            # ---- 阶段2：用已验证的密码解压全部文件 ----
+                    if "password" not in err and "incorrect" not in err: pass
+                except Exception: pass
+            if not matched: return False, "密码不在字典中", None
             try:
-                with pyzipper.AESZipFile(zip_path, 'r') as zipf:
-                    zipf.setpassword(self.safe_encode(matched_password))
-
-                    extracted_files = []
-                    for j, file_info in enumerate(file_list):
+                with _pyzipper.AESZipFile(zip_path, 'r') as zf:
+                    zf.setpassword(self.safe_encode(matched))
+                    extracted = []
+                    last_ts = [0]
+                    for j, fi in enumerate(flist):
+                        if cancel_check and cancel_check(): return False, "操作已取消", None
                         try:
-                            encrypted_name = file_info.filename
-                            filename = self.filename_encryptor.decrypt_filename(encrypted_name)
-
-                            output_path = os.path.join(output_dir, filename)
-                            dir_path = os.path.dirname(output_path)
-                            if dir_path and not os.path.exists(dir_path):
-                                os.makedirs(dir_path)
-
-                            with zipf.open(file_info) as source, \
-                                 open(output_path, 'wb') as target:
+                            fn = self.filename_encryptor.decrypt_filename(fi.filename)
+                            op = os.path.join(out_dir, fn)
+                            dp = os.path.dirname(op)
+                            if dp and not os.path.exists(dp): os.makedirs(dp)
+                            with zf.open(fi) as src, open(op, 'wb') as tgt:
                                 while True:
-                                    chunk = source.read(1024 * 1024)
-                                    if not chunk:
-                                        break
-                                    target.write(chunk)
+                                    if cancel_check and cancel_check(): return False, "操作已取消", None
+                                    chunk = src.read(1048576)
+                                    if not chunk: break
+                                    tgt.write(chunk)
+                            extracted.append(op)
+                            now = time.monotonic()
+                            if now - last_ts[0] >= 0.1 or j == fcount - 1:
+                                last_ts[0] = now
+                                if progress_cb: progress_cb(int((j + 1) / fcount * 100))
+                        except Exception: continue
+                    if extracted: return True, "解压成功", matched
+                    return True, "部分解压成功", None
+            except Exception as e: return False, "解压失败: " + str(e), None
+        except Exception as e: return False, "解压失败: " + str(e), None
 
-                            extracted_files.append(output_path)
-
-                            if progress_callback:
-                                progress_callback(int((j + 1) / file_count * 100))
-
-                        except Exception as e:
-                            logger.log(f"处理文件 {file_info.filename} 失败: {e}", "ERROR")
-                            continue
-
-                    if extracted_files:
-                        logger.log(f"成功提取 {len(extracted_files)} 个文件")
-                        return True, "解压成功，文件名已解密", matched_password
-                    else:
-                        return True, "部分解压成功，但密码验证异常", None
-
-            except Exception as e:
-                logger.log(f"解压阶段出错: {e}", "ERROR")
-                return False, "解压失败: " + str(e)
-
-        except Exception as e:
-            logger.log(f"解压严重错误: {e}", "ERROR")
-            return False, "解压失败: " + str(e)
 
 # ============================================================
-# 现代化主窗口
+# 主题
+# ============================================================
+THEMES = {
+    'light': {
+        'BG': '#F5F6FA', 'CARD': '#FFFFFF', 'PRIMARY': '#89CFF0',
+        'PRIMARY_HOVER': '#6ABDE6', 'DANGER': '#E74C3C', 'DANGER_HOVER': '#C0392B',
+        'TEXT': '#2D3436', 'TEXT_SEC': '#636E72', 'BORDER': '#DFE6E9',
+        'SUCCESS': '#00B894', 'TAB_BG': '#E8ECF1', 'HEADER_BG': '#89CFF0',
+        'HEADER_FG': '#FFFFFF', 'HEADER_SUB': '#E8F4FD',
+        'PROGRESS_TROUGH': '#E8ECF1', 'BTN_SEC_BG': '#FFFFFF',
+        'BTN_SEC_HOVER': '#F0F2F5', 'LOG_BG': '#FFFFFF',
+    },
+    'dark': {
+        'BG': '#1A1B2E', 'CARD': '#252641', 'PRIMARY': '#7BB8D4',
+        'PRIMARY_HOVER': '#5AA0C4', 'DANGER': '#E74C3C', 'DANGER_HOVER': '#C0392B',
+        'TEXT': '#E0E0E0', 'TEXT_SEC': '#8E9AAF', 'BORDER': '#3A3B5C',
+        'SUCCESS': '#00B894', 'TAB_BG': '#1E1F36', 'HEADER_BG': '#2A2B4A',
+        'HEADER_FG': '#E0E0E0', 'HEADER_SUB': '#8E9AAF',
+        'PROGRESS_TROUGH': '#3A3B5C', 'BTN_SEC_BG': '#2D2E4A',
+        'BTN_SEC_HOVER': '#3A3B5C', 'LOG_BG': '#1E1F36',
+    },
+}
+
+def _detect_system_theme():
+    """检测 Windows 系统主题"""
+    if sys.platform == 'win32':
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+            val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            winreg.CloseKey(key)
+            return 'light' if val == 1 else 'dark'
+        except Exception:
+            pass
+    return 'light'
+
+def _get_app_dir():
+    """获取应用数据目录（AppData/Roaming/FuFu-zip）"""
+    if sys.platform == 'win32':
+        base = os.environ.get('APPDATA', os.path.expanduser('~'))
+    elif sys.platform == 'darwin':
+        base = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support')
+    else:
+        base = os.path.join(os.path.expanduser('~'), '.config')
+    app_dir = os.path.join(base, 'FuFu-zip')
+    os.makedirs(app_dir, exist_ok=True)
+    return app_dir
+
+CONFIG_PATH = os.path.join(_get_app_dir(), 'config.json')
+DISCLAIMER_PATH = os.path.join(_get_app_dir(), '.disclaimer_accepted')
+
+def _load_theme_pref():
+    try:
+        with open(CONFIG_PATH, 'r') as f:
+            cfg = json.load(f)
+            return cfg.get('theme', 'system')
+    except Exception:
+        return 'system'
+
+def _save_theme_pref(pref):
+    try:
+        cfg = {}
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, 'r') as f: cfg = json.load(f)
+        cfg['theme'] = pref
+        with open(CONFIG_PATH, 'w') as f: json.dump(cfg, f)
+    except Exception:
+        pass
+
+def _resolve_theme(pref):
+    if pref == 'system': return _detect_system_theme()
+    return pref if pref in THEMES else 'light'
+
+
+# ============================================================
+# 主窗口
 # ============================================================
 class ModernMainWindow:
-    """现代化主窗口"""
     def __init__(self, root):
         self.root = root
-        self.root.title("FuFu-zip - 文件压缩解压工具 v1.0.0")
-        self.root.geometry("1000x750")
-        self.root.minsize(800, 550)
+        self.root.title("FuFu-zip v1.1.0")
+        self.root.geometry("960x680")
+        self.root.minsize(780, 520)
+        self._cancelled = False
 
-        try:
-            self.root.iconbitmap(default='secure_zip_icon.ico')
-        except:
-            pass
+        # 必须在窗口显示前设置 AppUserModelID，否则任务栏图标不生效
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('fufuzip.v1.1.0')
+            except Exception: pass
 
-        try:
-            self.password_manager = _create_password_manager()
-            self.zip_handler = SecureZipHandler(self.password_manager)
-        except Exception as e:
-            self._show_error("程序初始化失败", str(e))
-            self.root.quit()
-            return
+        self._set_window_icon()
 
-        self._create_style()
+        self.password_manager = None
+        self.zip_handler = None
+
+        # 主题
+        self._theme_pref = _load_theme_pref()  # 'light' / 'dark' / 'system'
+        self._apply_theme(_resolve_theme(self._theme_pref))
+
+        self._create_styles()
         self._create_widgets()
-        self._check_system()
-        self._add_log("🎉 欢迎使用 FuFu-zip")
-        self._add_log("🔒 文件名+扩展名全加密，.enc统一后缀")
-        self._add_log("🛡️ ZENC魔数校验，防误识别")
-        if _use_cython_core:
-            self._add_log("✅ 核心模块已编译（Cython二进制保护）")
-        else:
-            self._add_log("⚠️ 核心模块为纯Python（建议编译为Cython）")
+        self._setup_drag_drop()
+        self._add_log("🎉 欢迎使用 FuFu-zip v1.1.0")
+        self._add_log("🔒 文件名全加密 · AES-256 · ZENC 魔数校验")
         self._show_disclaimer()
 
-    def _create_style(self):
-        self.style = Style()
-        try:
-            self.style.theme_use('clam')
-        except:
-            pass
+    def _apply_theme(self, name):
+        self.T = THEMES.get(name, THEMES['light'])
+        self.root.configure(bg=self.T['BG'])
 
-        self.colors = {
-            'primary': '#2E86AB', 'secondary': '#A23B72',
-            'accent': '#F18F01', 'success': '#C73E1D',
-            'background': '#F8F9FA', 'card': '#FFFFFF',
-            'text': '#333333', 'text_light': '#666666',
-            'border': '#E0E0E0'
-        }
+    def _switch_theme(self, pref):
+        self._theme_pref = pref
+        _save_theme_pref(pref)
+        self._apply_theme(_resolve_theme(pref))
+        self._create_styles()
+        # 记住当前状态
+        old_files = list(self.file_list.get(0, tk.END))
+        old_zips = list(self.zip_list.get(0, tk.END))
+        old_log = self.log_text.get('1.0', tk.END) if self.log_text else ''
+        old_output = self.output_path.get()
+        old_extract = self.extract_path.get()
+        # 重建 UI（销毁所有子组件，包括 ttk）
+        for w in self.root.winfo_children():
+            w.destroy()
+        self._create_widgets()
+        # 恢复状态
+        for f in old_files: self.file_list.insert(tk.END, f)
+        for z in old_zips: self.zip_list.insert(tk.END, z)
+        if old_log.strip():
+            self.log_text.config(state=tk.NORMAL)
+            self.log_text.insert(tk.END, old_log)
+            self.log_text.config(state=tk.DISABLED)
+        self.output_path.delete(0, tk.END); self.output_path.insert(0, old_output)
+        self.extract_path.delete(0, tk.END); self.extract_path.insert(0, old_extract)
+        self._update_file_stats()
+        self._add_log(f"🎨 主题已切换: {pref}")
 
-        self.style.configure('Modern.TButton',
-                             background=self.colors['primary'], foreground='white',
-                             borderwidth=0, padding=8,
-                             font=('Microsoft YaHei', 10, 'bold'))
-        self.style.map('Modern.TButton',
-                       background=[('active', self.colors['secondary'])],
-                       foreground=[('active', 'white')])
-        self.style.configure('Modern.TNotebook',
-                             background=self.colors['background'], borderwidth=0)
-        self.style.configure('Modern.TNotebook.Tab',
-                             background=self.colors['card'], foreground=self.colors['text'],
-                             padding=[15, 8], font=('Microsoft YaHei', 11), borderwidth=0)
-        self.style.map('Modern.TNotebook.Tab',
-                       background=[('selected', self.colors['primary']),
-                                   ('active', self.colors['accent'])],
-                       foreground=[('selected', 'white'), ('active', 'white')])
-        self.style.configure('Modern.TFrame', background=self.colors['background'])
-        self.style.configure('Modern.TLabel',
-                             background=self.colors['background'],
-                             foreground=self.colors['text'],
-                             font=('Microsoft YaHei', 10))
-        self.style.configure('Modern.TEntry',
-                             background=self.colors['card'], foreground=self.colors['text'],
-                             borderwidth=1, relief='solid',
-                             fieldbackground=self.colors['card'], padding=6,
-                             font=('Microsoft YaHei', 10))
-        self.style.configure('Modern.Horizontal.TProgressbar',
-                             background=self.colors['primary'], borderwidth=0, relief='solid')
-        self.style.configure('Modern.TLabelframe',
-                             background=self.colors['background'], foreground=self.colors['text'],
-                             borderwidth=1, relief='solid', bordercolor=self.colors['border'])
-        self.style.configure('Modern.TLabelframe.Label',
-                             background=self.colors['background'], foreground=self.colors['text'],
-                             font=('Microsoft YaHei', 11, 'bold'))
+    def _set_window_icon(self):
+        """设置图标（延迟 + 定期刷新防止丢失）"""
+        # 缓存图标句柄
+        self._icon_hicon = None
+        self._icon_path = None
+        icon_names = ['fufu.ico', 'secure_zip_icon.ico']
+        search_dirs = []
+        if hasattr(sys, '_MEIPASS'):
+            search_dirs.append(sys._MEIPASS)
+        search_dirs.append(os.path.dirname(os.path.abspath(__file__)))
+        search_dirs.append(os.getcwd())
 
-    def _check_system(self):
-        try:
-            if sys.platform.startswith('win32'):
-                if ctypes.windll.shell32.IsUserAnAdmin() == 0:
-                    self._show_warning("权限提示", "建议以管理员身份运行以避免权限问题")
-        except:
-            pass
+        for name in icon_names:
+            for base in search_dirs:
+                p = os.path.join(base, name)
+                if os.path.exists(p):
+                    self._icon_path = p
+                    break
+            if self._icon_path:
+                break
 
-    def _show_disclaimer(self):
-        """显示免责声明（首次启动）"""
-        # 标记文件放在用户主目录，PyInstaller --onefile打包后临时目录会变
-        disclaimer_path = os.path.join(os.path.expanduser('~'),
-                                       '.securezip_disclaimer_accepted')
-        if os.path.exists(disclaimer_path):
+        if not self._icon_path:
             return
 
-        disclaimer_text = (
-            "【免责声明】\n\n"
-            "FuFu-zip 仅供个人学习与隐私保护使用。\n\n"
-            "• 请勿用于任何非法用途\n"
-            "• 请遵守当地法律法规\n"
-            "• 开发者不对因使用本软件造成的任何损失承担责任\n"
-            "• 使用本软件即表示您已阅读并同意本声明\n"
-        )
+        # 延迟首次设置
+        self.root.after(100, self._apply_icon)
+        # 窗口获焦时重新设置
+        self.root.bind('<FocusIn>', lambda e: self._apply_icon())
 
-        def _do():
-            if not tk_available:
-                return
-            dlg = tk.Toplevel(self.root)
-            dlg.title("免责声明")
-            dlg.geometry("500x320")
-            dlg.resizable(False, False)
-            dlg.transient(self.root)
-            dlg.grab_set()
+    def _apply_icon(self):
+        """应用图标到窗口和任务栏"""
+        if not self._icon_path or not os.path.exists(self._icon_path):
+            return
 
-            ttk.Label(dlg, text=disclaimer_text,
-                      font=('Microsoft YaHei', 10),
-                      wraplength=460, justify='left').pack(padx=20, pady=15)
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
 
-            skip_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(dlg, text="不再显示此声明",
-                            variable=skip_var).pack(padx=20, anchor='w')
+                IMAGE_ICON = 1
+                LR_LOADFROMFILE = 0x10
+                LR_DEFAULTSIZE = 0x40
+                WM_SETICON = 0x0080
+                ICON_SMALL = 0
+                ICON_BIG = 1
 
-            def _accept():
-                if skip_var.get():
-                    try:
-                        with open(disclaimer_path, 'w') as f:
-                            f.write(time.strftime('%Y-%m-%d %H:%M:%S'))
-                    except:
-                        pass
-                dlg.destroy()
+                # 每次都重新加载图标（防止缓存失效）
+                hicon = user32.LoadImageW(
+                    None, self._icon_path, IMAGE_ICON, 0, 0,
+                    LR_LOADFROMFILE | LR_DEFAULTSIZE
+                )
+                if hicon:
+                    hwnd = int(self.root.frame(), 16)
+                    user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon)
+                    user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon)
+                    self._icon_hicon = hicon
+                    return
+            except Exception:
+                pass
 
-            ttk.Button(dlg, text="我已阅读并同意", command=_accept,
-                       style='Modern.TButton').pack(pady=15)
+        try:
+            self.root.iconbitmap(self._icon_path)
+        except Exception:
+            pass
 
-            dlg.protocol("WM_DELETE_WINDOW", _accept)
+    def _ensure_handler(self):
+        if self.zip_handler is None:
+            self._add_log("⏳ 初始化加密模块...")
+            self.password_manager = _create_password_manager()
+            self.zip_handler = SecureZipHandler(self.password_manager)
+            self._add_log("✅ 就绪")
 
-        if threading.current_thread() is threading.main_thread():
-            _do()
-        else:
-            self.root.after(0, _do)
+    # ---------- 样式 ----------
+    def _create_styles(self):
+        T = self.T
+        s = ttk.Style()
+        try: s.theme_use('clam')
+        except Exception: pass
+        s.configure('.', background=T['BG'], foreground=T['TEXT'], font=('Microsoft YaHei', 10))
+        s.configure('Primary.TButton', background=T['PRIMARY'], foreground='white',
+                     borderwidth=0, padding=(18, 8), font=('Microsoft YaHei', 10, 'bold'))
+        s.map('Primary.TButton',
+               background=[('active', T['PRIMARY_HOVER']), ('disabled', '#B2BEC3')],
+               foreground=[('disabled', '#DFE6E9')])
+        s.configure('Secondary.TButton', background=T['BTN_SEC_BG'], foreground=T['TEXT'],
+                     borderwidth=1, relief='solid', padding=(14, 7), font=('Microsoft YaHei', 9))
+        s.map('Secondary.TButton', background=[('active', T['BTN_SEC_HOVER'])],
+               bordercolor=[('focus', T['PRIMARY'])])
+        s.configure('Danger.TButton', background=T['DANGER'], foreground='white',
+                     borderwidth=0, padding=(14, 7), font=('Microsoft YaHei', 9, 'bold'))
+        s.map('Danger.TButton',
+               background=[('active', T['DANGER_HOVER']), ('disabled', '#B2BEC3')])
+        s.configure('TFrame', background=T['BG'])
+        s.configure('TLabel', background=T['BG'], foreground=T['TEXT'], font=('Microsoft YaHei', 10))
+        s.configure('TEntry', fieldbackground=T['CARD'], foreground=T['TEXT'],
+                     borderwidth=1, relief='solid', padding=8, font=('Microsoft YaHei', 10))
+        s.map('TEntry', bordercolor=[('focus', T['PRIMARY'])])
+        s.configure('TNotebook', background=T['TAB_BG'], borderwidth=0)
+        s.configure('TNotebook.Tab', background=T['TAB_BG'], foreground=T['TEXT_SEC'],
+                     padding=[20, 10], font=('Microsoft YaHei', 10))
+        s.map('TNotebook.Tab',
+               background=[('selected', T['CARD']), ('active', T['BTN_SEC_HOVER'])],
+               foreground=[('selected', T['PRIMARY']), ('active', T['TEXT'])])
+        s.configure('TProgressbar', background=T['PRIMARY'], troughcolor=T['PROGRESS_TROUGH'],
+                     borderwidth=0, thickness=6)
+        s.configure('TLabelframe', background=T['CARD'], foreground=T['TEXT'], borderwidth=0)
+        s.configure('TLabelframe.Label', background=T['CARD'], foreground=T['TEXT_SEC'],
+                     font=('Microsoft YaHei', 10, 'bold'))
+        s.configure('TCheckbutton', background=T['CARD'], foreground=T['TEXT'], font=('Microsoft YaHei', 10))
 
+    # ---------- 主布局 ----------
     def _create_widgets(self):
-        self.root.config(bg=self.colors['background'])
-        self.main_frame = ttk.Frame(self.root, style='Modern.TFrame')
-        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        T = self.T
+        # 标题栏
+        hdr = tk.Frame(self.root, bg=T['HEADER_BG'], height=56)
+        hdr.pack(fill=tk.X); hdr.pack_propagate(False)
+        tk.Label(hdr, text="🔒  FuFu-zip", bg=T['HEADER_BG'], fg=T['HEADER_FG'],
+                 font=('Microsoft YaHei', 16, 'bold')).pack(side=tk.LEFT, padx=20, pady=12)
+        tk.Label(hdr, text="v1.1.0  ·  AES-256  ·  ZENC", bg=T['HEADER_BG'],
+                 fg=T['HEADER_SUB'], font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=10, pady=12)
 
-        self.notebook = ttk.Notebook(self.main_frame, style='Modern.TNotebook')
+        # 主题切换按钮
+        theme_frame = tk.Frame(hdr, bg=T['HEADER_BG'])
+        theme_frame.pack(side=tk.RIGHT, padx=16)
+        for label, pref in [("☀️", "light"), ("🌙", "dark"), ("💻", "system")]:
+            btn = tk.Button(theme_frame, text=label, bg=T['HEADER_BG'], fg=T['HEADER_FG'],
+                            relief='flat', bd=0, font=('Microsoft YaHei', 11), cursor='hand2',
+                            activebackground=T['PRIMARY_HOVER'],
+                            command=lambda p=pref: self._switch_theme(p))
+            btn.pack(side=tk.LEFT, padx=2)
+            # 当前选中加下划线
+            if pref == self._theme_pref:
+                btn.configure(font=('Microsoft YaHei', 11, 'underline'))
+
+        content = ttk.Frame(self.root)
+        content.pack(fill=tk.BOTH, expand=True, padx=16, pady=(12, 16))
+        self.notebook = ttk.Notebook(content)
         self.notebook.pack(fill=tk.BOTH, expand=True)
-
         self._create_compress_tab()
         self._create_decompress_tab()
         self._create_log_tab()
-        self._create_security_tab()
-        self._create_status_bar()
+        self._create_about_tab()
+
+        # 底部状态栏
+        bar = tk.Frame(self.root, bg=T['CARD'], height=32)
+        bar.pack(fill=tk.X, side=tk.BOTTOM); bar.pack_propagate(False)
+        tk.Frame(bar, bg=T['BORDER'], height=1).pack(fill=tk.X)
+        self.status_info = tk.Label(bar, text="✅ 就绪", bg=T['CARD'],
+                                    fg=T['TEXT_SEC'], font=('Microsoft YaHei', 9))
+        self.status_info.pack(side=tk.RIGHT, padx=16)
+
+    def _card(self, parent, **kw):
+        T = self.T
+        outer = tk.Frame(parent, bg=T['BORDER'], padx=1, pady=1)
+        outer.pack(fill=tk.BOTH, **kw)
+        inner = tk.Frame(outer, bg=T['CARD'])
+        inner.pack(fill=tk.BOTH, expand=True)
+        return inner
+
+    def _card_header(self, parent, text, icon=""):
+        T = self.T
+        f = tk.Frame(parent, bg=T['CARD']); f.pack(fill=tk.X, padx=16, pady=(14, 6))
+        tk.Label(f, text=f"{icon}  {text}" if icon else text,
+                 bg=T['CARD'], fg=T['TEXT'], font=('Microsoft YaHei', 11, 'bold')).pack(anchor='w')
+
+    def _input_row(self, parent, label, default="", cmd=None):
+        T = self.T
+        f = tk.Frame(parent, bg=T['CARD']); f.pack(fill=tk.X, padx=16, pady=8)
+        tk.Label(f, text=label, bg=T['CARD'], fg=T['TEXT_SEC'],
+                 font=('Microsoft YaHei', 9), width=10, anchor='w').pack(side=tk.LEFT)
+        entry = tk.Entry(f, bg=T['CARD'], fg=T['TEXT'], relief='solid', bd=1,
+                         font=('Microsoft YaHei', 10), highlightthickness=1,
+                         highlightbackground=T['BORDER'], highlightcolor=T['PRIMARY'])
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        if default: entry.insert(0, default)
+        if cmd:
+            tk.Button(f, text="浏览", bg=T['BTN_SEC_BG'], fg=T['TEXT'], relief='solid', bd=1,
+                      font=('Microsoft YaHei', 9), activebackground=T['BTN_SEC_HOVER'],
+                      cursor='hand2', command=cmd).pack(side=tk.RIGHT)
+        return entry
+
+    def _btn(self, parent, text, command, style='primary', **kw):
+        T = self.T
+        if style == 'primary':
+            bg, fg, hover = T['PRIMARY'], 'white', T['PRIMARY_HOVER']
+            font = ('Microsoft YaHei', 10, 'bold')
+        elif style == 'danger':
+            bg, fg, hover = T['DANGER'], 'white', T['DANGER_HOVER']
+            font = ('Microsoft YaHei', 9, 'bold')
+        else:
+            bg, fg, hover = T['BTN_SEC_BG'], T['TEXT'], T['BTN_SEC_HOVER']
+            font = ('Microsoft YaHei', 9)
+        btn = tk.Button(parent, text=text, command=command, bg=bg, fg=fg,
+                        relief='flat', bd=0, font=font, cursor='hand2',
+                        activebackground=hover, activeforeground=fg, padx=16, pady=6)
+        btn.pack(**kw)
+        btn.bind('<Enter>', lambda e, b=btn, h=hover: b.config(bg=h))
+        btn.bind('<Leave>', lambda e, b=btn, c=bg: b.config(bg=c))
+        return btn
+
+    def _listbox(self, parent, height=8):
+        T = self.T
+        f = tk.Frame(parent, bg=T['CARD']); f.pack(fill=tk.BOTH, expand=True, padx=16, pady=(4, 12))
+        lb = tk.Listbox(f, bg=T['CARD'], fg=T['TEXT'], relief='flat', bd=0,
+                        highlightthickness=1, highlightbackground=T['BORDER'],
+                        highlightcolor=T['PRIMARY'], selectbackground=T['PRIMARY'],
+                        selectforeground='white', font=('Microsoft YaHei', 9),
+                        height=height, activestyle='none', selectmode=tk.EXTENDED)
+        lb.pack(fill=tk.BOTH, expand=True)
+        return lb
 
     # ---------- 压缩标签页 ----------
     def _create_compress_tab(self):
-        tab = ttk.Frame(self.notebook, style='Modern.TFrame')
-        self.notebook.add(tab, text="📦 压缩文件")
-
-        file_frame = ttk.LabelFrame(tab, text="📁 选择文件/文件夹", style='Modern.TLabelframe')
-        file_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
-
-        list_frame = ttk.Frame(file_frame, style='Modern.TFrame')
-        list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        self.file_list = tk.Listbox(list_frame,
-                                    bg=self.colors['card'], fg=self.colors['text'],
-                                    bd=1, relief='solid',
-                                    highlightbackground=self.colors['primary'],
-                                    highlightthickness=1,
-                                    selectbackground=self.colors['primary'],
-                                    selectforeground='white',
-                                    font=('Microsoft YaHei', 10), height=10)
-        self.file_list.pack(fill=tk.BOTH, expand=True)
-
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.file_list.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.file_list.config(yscrollcommand=scrollbar.set)
-
-        btn_frame = ttk.Frame(file_frame, style='Modern.TFrame')
-        btn_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=10, pady=10)
-
-        for text, cmd in [("📄 添加文件", self._add_files),
-                          ("📁 添加文件夹", self._add_folder),
-                          ("❌ 移除选中", self._remove_selected),
-                          ("🗑️ 清空列表", self._clear_list)]:
-            ttk.Button(btn_frame, text=text, command=cmd, style='Modern.TButton').pack(fill=tk.X, pady=5, padx=5)
-
-        output_frame = ttk.LabelFrame(tab, text="📤 输出设置", style='Modern.TLabelframe')
-        output_frame.pack(fill=tk.X, padx=15, pady=10)
-
-        path_frame = ttk.Frame(output_frame, style='Modern.TFrame')
-        path_frame.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Label(path_frame, text="输出文件:", style='Modern.TLabel').pack(side=tk.LEFT, padx=5, pady=5)
-        self.output_path = ttk.Entry(path_frame, style='Modern.TEntry')
-        self.output_path.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10, pady=5)
-        self.output_path.insert(0, os.path.join(os.path.expanduser("~"), "encrypted.zip"))
-        ttk.Button(path_frame, text="📂 浏览", command=self._select_output_file, style='Modern.TButton').pack(side=tk.LEFT, padx=5, pady=5)
-
-        self.file_stats = ttk.Label(output_frame, text="📊 已添加: 0个文件/文件夹", style='Modern.TLabel')
-        self.file_stats.pack(padx=10, pady=5)
-
-        progress_frame = ttk.Frame(tab, style='Modern.TFrame')
-        progress_frame.pack(fill=tk.X, padx=15, pady=10)
-        self.compress_progress = ttk.Progressbar(progress_frame, orient=tk.HORIZONTAL,
-                                                  mode='determinate',
-                                                  style='Modern.Horizontal.TProgressbar')
-        self.compress_progress.pack(fill=tk.X, expand=True, padx=10, pady=5)
-
-        status_frame = ttk.Frame(progress_frame, style='Modern.TFrame')
-        status_frame.pack(fill=tk.X, padx=10, pady=5)
-        self.compress_status = ttk.Label(status_frame, text="✅ 准备就绪", style='Modern.TLabel')
-        self.compress_status.pack(side=tk.LEFT, padx=10)
-        self.compress_btn = ttk.Button(status_frame, text="🚀 开始压缩",
-                                        command=self._start_compression, style='Modern.TButton')
-        self.compress_btn.pack(side=tk.RIGHT, padx=10)
+        T = self.T
+        tab = ttk.Frame(self.notebook); self.notebook.add(tab, text="  📦  压缩  ")
+        card = self._card(tab, pady=(0, 8))
+        self._card_header(card, "选择文件 / 文件夹", "📁")
+        row = tk.Frame(card, bg=T['CARD']); row.pack(fill=tk.X, padx=16, pady=(0, 6))
+        self._btn(row, "📄 添加文件", self._add_files, 'secondary', side=tk.LEFT, padx=(0, 6))
+        self._btn(row, "📁 添加文件夹", self._add_folder, 'secondary', side=tk.LEFT, padx=(0, 6))
+        self._btn(row, "移除选中", self._remove_selected, 'secondary', side=tk.LEFT, padx=(0, 6))
+        self._btn(row, "清空", self._clear_list, 'secondary', side=tk.LEFT)
+        self.file_list = self._listbox(card)
+        self.file_stats = tk.Label(card, text="已添加: 0 项", bg=T['CARD'],
+                                   fg=T['TEXT_SEC'], font=('Microsoft YaHei', 9))
+        self.file_stats.pack(padx=16, anchor='w')
+        card2 = self._card(tab, pady=(0, 8))
+        self._card_header(card2, "输出设置", "📤")
+        self.output_path = self._input_row(card2, "输出文件", "", self._select_output_file)
+        af = tk.Frame(tab, bg=T['BG']); af.pack(fill=tk.X, pady=(4, 0))
+        self.compress_btn = self._btn(af, "🚀  开始压缩", self._start_compression,
+                                       'primary', side=tk.LEFT, padx=(0, 8))
+        self.compress_cancel_btn = self._btn(af, "取消", self._request_cancel, 'danger', side=tk.LEFT)
+        self.compress_cancel_btn.pack_forget()
+        self.compress_status = tk.Label(af, text="就绪", bg=T['BG'], fg=T['TEXT_SEC'],
+                                        font=('Microsoft YaHei', 9))
+        self.compress_status.pack(side=tk.LEFT, padx=16)
+        self.compress_pf = tk.Frame(tab, bg=T['BG'])
+        self.compress_progress = ttk.Progressbar(self.compress_pf, mode='determinate')
+        self.compress_progress.pack(fill=tk.X, pady=(8, 0))
 
     # ---------- 解压标签页 ----------
     def _create_decompress_tab(self):
-        tab = ttk.Frame(self.notebook, style='Modern.TFrame')
-        self.notebook.add(tab, text="📤 解压文件")
+        T = self.T
+        tab = ttk.Frame(self.notebook); self.notebook.add(tab, text="  📤  解压  ")
+        card = self._card(tab, pady=(0, 8))
+        self._card_header(card, "选择 ZIP 文件", "📦")
+        row = tk.Frame(card, bg=T['CARD']); row.pack(fill=tk.X, padx=16, pady=(0, 6))
+        self._btn(row, "📂 添加ZIP", self._add_zip_files, 'secondary', side=tk.LEFT, padx=(0, 6))
+        self._btn(row, "移除选中", self._remove_selected_zip, 'secondary', side=tk.LEFT, padx=(0, 6))
+        self._btn(row, "清空", self._clear_zip_list, 'secondary', side=tk.LEFT)
+        self.zip_list = self._listbox(card, height=5)
+        card2 = self._card(tab, pady=(0, 8))
+        self._card_header(card2, "输出设置", "📁")
+        self.extract_path = self._input_row(card2, "输出目录", "", self._select_extract_dir)
+        tk.Label(card2, text="内置100条密码，自动尝试解密 · ZENC 魔数校验",
+                 bg=T['CARD'], fg=T['TEXT_SEC'], font=('Microsoft YaHei', 9)
+                 ).pack(padx=16, pady=(0, 12), anchor='w')
+        af = tk.Frame(tab, bg=T['BG']); af.pack(fill=tk.X, pady=(4, 0))
+        self.decompress_btn = self._btn(af, "🚀  开始解压", self._start_decompression,
+                                         'primary', side=tk.LEFT, padx=(0, 8))
+        self.decompress_cancel_btn = self._btn(af, "取消", self._request_cancel, 'danger', side=tk.LEFT)
+        self.decompress_cancel_btn.pack_forget()
+        self.decompress_status = tk.Label(af, text="就绪", bg=T['BG'], fg=T['TEXT_SEC'],
+                                          font=('Microsoft YaHei', 9))
+        self.decompress_status.pack(side=tk.LEFT, padx=16)
+        self.decompress_pf = tk.Frame(tab, bg=T['BG'])
+        self.decompress_progress = ttk.Progressbar(self.decompress_pf, mode='determinate')
+        self.decompress_progress.pack(fill=tk.X, pady=(8, 0))
 
-        zip_frame = ttk.LabelFrame(tab, text="📦 选择ZIP文件", style='Modern.TLabelframe')
-        zip_frame.pack(fill=tk.X, padx=15, pady=15)
-        zip_path_frame = ttk.Frame(zip_frame, style='Modern.TFrame')
-        zip_path_frame.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Label(zip_path_frame, text="ZIP文件:", style='Modern.TLabel').pack(side=tk.LEFT, padx=5, pady=5)
-        self.zip_path = ttk.Entry(zip_path_frame, style='Modern.TEntry')
-        self.zip_path.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10, pady=5)
-        ttk.Button(zip_path_frame, text="📂 浏览", command=self._select_zip_file, style='Modern.TButton').pack(side=tk.LEFT, padx=5, pady=5)
-
-        extract_frame = ttk.LabelFrame(tab, text="📁 输出设置", style='Modern.TLabelframe')
-        extract_frame.pack(fill=tk.X, padx=15, pady=10)
-        extract_path_frame = ttk.Frame(extract_frame, style='Modern.TFrame')
-        extract_path_frame.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Label(extract_path_frame, text="输出目录:", style='Modern.TLabel').pack(side=tk.LEFT, padx=5, pady=5)
-        self.extract_path = ttk.Entry(extract_path_frame, style='Modern.TEntry')
-        self.extract_path.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10, pady=5)
-        self.extract_path.insert(0, os.path.join(os.path.expanduser("~"), "解压文件"))
-        ttk.Button(extract_path_frame, text="📂 浏览", command=self._select_extract_dir, style='Modern.TButton').pack(side=tk.LEFT, padx=5, pady=5)
-
-        ttk.Label(tab, text="🔒 内置100条密码，自动尝试解密 | ZENC魔数校验文件名",
-                  style='Modern.TLabel').pack(padx=15, pady=5)
-
-        progress_frame = ttk.Frame(tab, style='Modern.TFrame')
-        progress_frame.pack(fill=tk.X, padx=15, pady=10)
-        self.decompress_progress = ttk.Progressbar(progress_frame, orient=tk.HORIZONTAL,
-                                                    mode='determinate',
-                                                    style='Modern.Horizontal.TProgressbar')
-        self.decompress_progress.pack(fill=tk.X, expand=True, padx=10, pady=5)
-        status_frame = ttk.Frame(progress_frame, style='Modern.TFrame')
-        status_frame.pack(fill=tk.X, padx=10, pady=5)
-        self.decompress_status = ttk.Label(status_frame, text="✅ 准备就绪", style='Modern.TLabel')
-        self.decompress_status.pack(side=tk.LEFT, padx=10)
-        self.decompress_btn = ttk.Button(status_frame, text="🚀 开始解压",
-                                          command=self._start_decompression, style='Modern.TButton')
-        self.decompress_btn.pack(side=tk.RIGHT, padx=10)
-
-    # ---------- 日志标签页 ----------
+    # ---------- 日志 ----------
     def _create_log_tab(self):
-        tab = ttk.Frame(self.notebook, style='Modern.TFrame')
-        self.notebook.add(tab, text="📝 操作日志")
+        T = self.T
+        tab = ttk.Frame(self.notebook); self.notebook.add(tab, text="  📝  日志  ")
+        card = self._card(tab, pady=(0, 8))
+        self._card_header(card, "操作记录", "📊")
+        self.log_text = scrolledtext.ScrolledText(card, bg=T['LOG_BG'], fg=T['TEXT'],
+                                                  relief='flat', bd=0, highlightthickness=1,
+                                                  highlightbackground=T['BORDER'],
+                                                  font=('Microsoft YaHei', 9), wrap=tk.WORD,
+                                                  state=tk.DISABLED)
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+        row = tk.Frame(card, bg=T['CARD']); row.pack(fill=tk.X, padx=16, pady=(0, 12))
+        self._btn(row, "🗑️ 清空", self._clear_log, 'secondary', side=tk.LEFT, padx=(0, 6))
+        self._btn(row, "📋 复制", self._copy_log, 'secondary', side=tk.LEFT)
 
-        log_frame = ttk.LabelFrame(tab, text="📊 操作记录", style='Modern.TLabelframe')
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+    # ---------- 关于 ----------
+    def _create_about_tab(self):
+        T = self.T
+        tab = ttk.Frame(self.notebook); self.notebook.add(tab, text="  ℹ️  关于  ")
+        card = self._card(tab, pady=(0, 8))
+        self._card_header(card, "功能特性", "🔐")
+        for title, desc in [("文件名全加密", "文件名+扩展名一起加密，统一.enc后缀"),
+                            ("ZENC 魔数校验", "密文头部4字节标记，精确识别"),
+                            ("AES-256 加密", "AES-256-CBC加密文件名，ZIP内容AES-256"),
+                            ("100条密码字典", "内置50位高强度随机密码"),
+                            ("批量解压", "支持同时解压多个ZIP文件"),
+                            ("深色模式", "浅色/深色/随系统自动切换")]:
+            row = tk.Frame(card, bg=T['CARD']); row.pack(fill=tk.X, padx=20, pady=6)
+            tk.Label(row, text="•", bg=T['CARD'], fg=T['PRIMARY'],
+                     font=('Microsoft YaHei', 12, 'bold'), width=2).pack(side=tk.LEFT, anchor='n')
+            tk.Label(row, text=title, bg=T['CARD'], fg=T['TEXT'],
+                     font=('Microsoft YaHei', 10, 'bold')).pack(side=tk.LEFT)
+            tk.Label(row, text=desc, bg=T['CARD'], fg=T['TEXT_SEC'],
+                     font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=(12, 0))
+        tk.Frame(card, bg=T['CARD'], height=12).pack()
+        card2 = self._card(tab, pady=(0, 8))
+        self._card_header(card2, "使用提示", "💡")
+        for tip in ["重要文件请做好多重备份", "确保使用同一版本进行压缩和解压"]:
+            tk.Label(card2, text=f"  ▸  {tip}", bg=T['CARD'], fg=T['TEXT_SEC'],
+                     font=('Microsoft YaHei', 9)).pack(fill=tk.X, padx=20, pady=4)
+        tk.Frame(card2, bg=T['CARD'], height=8).pack()
 
-        self.log_text = scrolledtext.ScrolledText(log_frame,
-                                                  bg=self.colors['card'], fg=self.colors['text'],
-                                                  bd=1, relief='solid',
-                                                  highlightbackground=self.colors['primary'],
-                                                  highlightthickness=1,
-                                                  font=('Microsoft YaHei', 10), wrap=tk.WORD)
-        self.log_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        self.log_text.config(state=tk.DISABLED)
+    # ---------- 拖拽 ----------
+    def _setup_drag_drop(self):
+        try:
+            import windnd
+            windnd.hook_dropfiles(self.root, func=self._on_drop)
+            self._add_log("✅ 拖拽已启用")
+        except ImportError:
+            self._add_log("💡 拖拽不可用，请使用按钮添加文件")
 
-        ctrl = ttk.Frame(log_frame, style='Modern.TFrame')
-        ctrl.pack(fill=tk.X, padx=10, pady=5)
-        ttk.Button(ctrl, text="🗑️ 清空日志", command=self._clear_log, style='Modern.TButton').pack(side=tk.LEFT, padx=5)
-        ttk.Button(ctrl, text="📋 复制日志", command=self._copy_log, style='Modern.TButton').pack(side=tk.LEFT, padx=5)
+    def _on_drop(self, files):
+        if isinstance(files, (list, tuple)):
+            for f in files:
+                if isinstance(f, bytes):
+                    # Windows 拖拽用系统编码（中文系统为 GBK）
+                    for enc in ('gbk', 'utf-8', 'latin-1'):
+                        try: f = f.decode(enc); break
+                        except Exception: continue
+                    else:
+                        f = f.decode('utf-8', errors='replace')
+                f = f.strip()
+                if f not in self.file_list.get(0, tk.END):
+                    self.file_list.insert(tk.END, f)
+                if f.lower().endswith('.zip') and f not in self.zip_list.get(0, tk.END):
+                    self.zip_list.insert(tk.END, f)
+            self._update_file_stats()
 
-    # ---------- 安全标签页 ----------
-    def _create_security_tab(self):
-        tab = ttk.Frame(self.notebook, style='Modern.TFrame')
-        self.notebook.add(tab, text="🛡️ 安全设置")
+    def _request_cancel(self): self._cancelled = True; self._add_log("⛔ 取消中...")
+    def _is_cancelled(self): return self._cancelled
+    def _reset_cancel(self): self._cancelled = False
 
-        sec = ttk.LabelFrame(tab, text="🔐 安全信息", style='Modern.TLabelframe')
-        sec.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+    # ---------- 免责声明 ----------
+    def _show_disclaimer(self):
+        dp = DISCLAIMER_PATH
+        if os.path.exists(dp): return
+        def _do():
+            T = self.T
+            dlg = tk.Toplevel(self.root); dlg.title("免责声明")
+            dlg.geometry("460x300"); dlg.resizable(False, False)
+            dlg.transient(self.root); dlg.grab_set(); dlg.configure(bg=T['CARD'])
+            tk.Label(dlg, text="【免责声明】\n\nFuFu-zip 仅供个人学习与隐私保护使用。\n\n"
+                     "• 请勿用于任何非法用途\n• 请遵守当地法律法规\n"
+                     "• 开发者不对任何损失承担责任\n• 使用即表示同意",
+                     bg=T['CARD'], fg=T['TEXT'], font=('Microsoft YaHei', 10),
+                     wraplength=420, justify='left').pack(padx=20, pady=20)
+            sv = tk.BooleanVar(value=False)
+            tk.Checkbutton(dlg, text="不再显示", variable=sv, bg=T['CARD'], fg=T['TEXT_SEC'],
+                           font=('Microsoft YaHei', 9), activebackground=T['CARD']).pack(padx=20, anchor='w')
+            def _ok():
+                if sv.get():
+                    try:
+                        with open(dp, 'w') as f: f.write(time.strftime('%Y-%m-%d %H:%M:%S'))
+                    except Exception: pass
+                dlg.destroy()
+            self._btn(dlg, "我已阅读并同意", _ok, 'primary', pady=16)
+            dlg.protocol("WM_DELETE_WINDOW", _ok)
+        if threading.current_thread() is threading.main_thread(): _do()
+        else: self.root.after(0, _do)
 
-        features = [
-            ("🔒 文件名全加密", "文件名+扩展名一起加密，统一.enc后缀，完全隐藏文件类型"),
-            ("🛡 ZENC魔数校验", "密文头部4字节魔数标记，精确识别本程序加密文件"),
-            ("🔑 AES-256加密", "军用级AES-256-CBC加密文件名，ZIP内容AES-256加密"),
-            ("📦 100条密码字典", "内置100条50位高强度随机密码，压缩随机选一条"),
-            ("🚫 零外部文件", "完全独立运行，不生成任何外部配置或对照文档"),
-            ("🔒 Cython保护（可选）", "核心模块可编译为二进制，防止反编译获取密钥"),
-            ("🧵 线程安全UI", "子线程操作通过root.after调度到主线程，杜绝崩溃"),
-        ]
-        for title, desc in features:
-            f = ttk.Frame(sec, style='Modern.TFrame')
-            f.pack(fill=tk.X, padx=20, pady=8)
-            ttk.Label(f, text=title, style='Modern.TLabel',
-                      font=('Microsoft YaHei', 11, 'bold'),
-                      foreground=self.colors['primary']).pack(anchor=tk.W)
-            ttk.Label(f, text=desc, style='Modern.TLabel',
-                      font=('Microsoft YaHei', 9),
-                      foreground=self.colors['text_light']).pack(anchor=tk.W, padx=20, pady=2)
-
-        warn = ttk.LabelFrame(tab, text="⚠️ 重要提醒", style='Modern.TLabelframe')
-        warn.pack(fill=tk.X, padx=15, pady=10)
-        for w in ["1. 重要文件请做好多重备份，避免数据丢失",
-                   "2. 建议使用Cython编译核心模块后再分发",
-                   "3. 确保使用同一版本进行压缩和解压",
-                   "4. 请勿修改程序文件结构"]:
-            ttk.Label(warn, text=w, style='Modern.TLabel',
-                      font=('Microsoft YaHei', 10),
-                      foreground=self.colors['success']).pack(anchor=tk.W, padx=20, pady=3)
-
-    # ---------- 状态栏 ----------
-    def _create_status_bar(self):
-        bar = ttk.Frame(self.main_frame, style='Modern.TFrame', relief='solid', borderwidth=1)
-        bar.pack(fill=tk.X, pady=15)
-        ttk.Label(bar, text="FuFu-zip | ZENC + AES-256",
-                  style='Modern.TLabel', font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=15, pady=5)
-        self.status_info = ttk.Label(bar, text="✅ 就绪",
-                                     style='Modern.TLabel', font=('Microsoft YaHei', 9))
-        self.status_info.pack(side=tk.RIGHT, padx=15, pady=5)
-
-    # ============================================================
-    # UI操作（线程安全：所有UI更新通过root.after调度）
-    # ============================================================
-    def _add_log(self, message):
-        """添加日志（线程安全）"""
+    # ---------- 线程安全 UI ----------
+    def _add_log(self, msg):
         def _do():
             try:
                 self.log_text.config(state=tk.NORMAL)
-                ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                self.log_text.insert(tk.END, f"[{ts}] {message}\n")
-                self.log_text.see(tk.END)
-                self.log_text.config(state=tk.DISABLED)
-                self.status_info.config(text=f"📝 {message[:30]}...")
-            except:
-                pass
-        if threading.current_thread() is threading.main_thread():
-            _do()
+                self.log_text.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+                self.log_text.see(tk.END); self.log_text.config(state=tk.DISABLED)
+                self.status_info.config(text=msg[:40])
+                self.root.update_idletasks()  # 立即刷新UI防止卡死
+            except Exception: pass
+        if threading.current_thread() is threading.main_thread(): _do()
         else:
-            self.root.after(0, _do)
+            try: self.root.after(0, _do)
+            except Exception: pass
 
-    def _update_progress(self, progress_bar, status_label, value, text):
-        """更新进度条和状态（线程安全）"""
-        def _do():
-            progress_bar['value'] = value
-            status_label.config(text=text)
-        if threading.current_thread() is threading.main_thread():
-            _do()
+    def _update_progress(self, bar, label, v, text):
+        def _do(): bar['value'] = v; label.config(text=text)
+        if threading.current_thread() is threading.main_thread(): _do()
+        else: self.root.after(0, _do)
+
+    def _show_error(self, title, msg):
+        def _do(): messagebox.showerror(title, msg) if tk_available else print(f"错误: {msg}")
+        if threading.current_thread() is threading.main_thread(): _do()
+        else: self.root.after(0, _do)
+
+    def _set_btn_state(self, btn, state):
+        def _do(): btn.config(state=state)
+        if threading.current_thread() is threading.main_thread(): _do()
+        else: self.root.after(0, _do)
+
+    def _play_done_sound(self):
+        """完成提示音"""
+        if sys.platform == 'win32':
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            except Exception: pass
+
+    def _open_output_folder(self, path):
+        """打开输出目录"""
+        folder = os.path.dirname(os.path.abspath(path))
+        if not os.path.isdir(folder): return
+        if sys.platform == 'win32':
+            os.startfile(folder)
+        elif sys.platform == 'darwin':
+            os.system(f'open "{folder}"')
         else:
-            self.root.after(0, _do)
+            os.system(f'xdg-open "{folder}"')
 
-    def _show_error(self, title, message):
-        """显示错误弹窗（线程安全）"""
-        def _do():
-            if tk_available:
-                messagebox.showerror(title, message)
-            else:
-                print(f"错误: {message}")
-        if threading.current_thread() is threading.main_thread():
-            _do()
-        else:
-            self.root.after(0, _do)
-
-    def _show_warning(self, title, message):
-        """显示警告弹窗（线程安全）"""
-        def _do():
-            if tk_available:
-                messagebox.showwarning(title, message)
-            else:
-                print(f"警告: {message}")
-        if threading.current_thread() is threading.main_thread():
-            _do()
-        else:
-            self.root.after(0, _do)
-
-    def _set_button_state(self, btn, state):
-        """设置按钮状态（线程安全）"""
-        def _do():
-            btn.config(state=state)
-        if threading.current_thread() is threading.main_thread():
-            _do()
-        else:
-            self.root.after(0, _do)
-
-    # ============================================================
-    # 文件操作
-    # ============================================================
+    # ---------- 文件操作 ----------
     def _add_files(self):
         files = filedialog.askopenfilenames(title="选择文件", filetypes=[("所有文件", "*.*")])
         if files:
             for f in files:
-                if f not in self.file_list.get(0, tk.END):
-                    self.file_list.insert(tk.END, f)
+                if f not in self.file_list.get(0, tk.END): self.file_list.insert(tk.END, f)
             self._update_file_stats()
-            self._add_log(f"📄 添加了 {len(files)} 个文件")
+            self._update_output_path()
 
     def _add_folder(self):
-        folder = filedialog.askdirectory(title="选择文件夹")
-        if folder:
-            if folder not in self.file_list.get(0, tk.END):
-                self.file_list.insert(tk.END, folder)
-            self._update_file_stats()
-            self._add_log(f"📁 添加了文件夹: {folder}")
+        d = filedialog.askdirectory(title="选择文件夹")
+        if d and d not in self.file_list.get(0, tk.END):
+            self.file_list.insert(tk.END, d); self._update_file_stats()
+            self._update_output_path()
 
     def _remove_selected(self):
-        for index in reversed(self.file_list.curselection()):
-            self.file_list.delete(index)
+        for i in reversed(self.file_list.curselection()): self.file_list.delete(i)
         self._update_file_stats()
 
-    def _clear_list(self):
-        count = self.file_list.size()
-        self.file_list.delete(0, tk.END)
-        self._update_file_stats()
-        self._add_log(f"🗑️ 清空文件列表（共 {count} 项）")
+    def _clear_list(self): self.file_list.delete(0, tk.END); self._update_file_stats()
 
     def _update_file_stats(self):
-        count = self.file_list.size()
-        self.file_stats.config(text=f"📊 已添加: {count}个文件/文件夹")
+        self.file_stats.config(text=f"已添加: {self.file_list.size()} 项")
+
+    def _update_output_path(self):
+        """根据已添加的文件自动更新默认输出路径（参考7-Zip）"""
+        items = self.file_list.get(0, tk.END)
+        if not items:
+            return
+        first = items[0]
+        if os.path.isfile(first):
+            # 单文件：同目录下 同名.zip
+            out_dir = os.path.dirname(first)
+            out_name = os.path.splitext(os.path.basename(first))[0] + '.zip'
+        else:
+            # 文件夹：上级目录下 文件夹名.zip
+            out_dir = os.path.dirname(first)
+            out_name = os.path.basename(first) + '.zip'
+        out_path = os.path.join(out_dir, out_name)
+        self.output_path.delete(0, tk.END)
+        self.output_path.insert(0, out_path)
+
+    def _update_extract_path(self):
+        """根据选择的ZIP自动更新默认解压路径"""
+        zips = self.zip_list.get(0, tk.END)
+        if not zips:
+            return
+        first = zips[0]
+        if os.path.isfile(first):
+            # ZIP所在目录
+            out_dir = os.path.dirname(first)
+        else:
+            out_dir = os.path.dirname(first)
+        self.extract_path.delete(0, tk.END)
+        self.extract_path.insert(0, out_dir)
 
     def _select_output_file(self):
-        output = filedialog.asksaveasfilename(title="保存压缩文件",
-                                              defaultextension=".zip",
-                                              filetypes=[("ZIP文件", "*.zip"), ("所有文件", "*.*")])
-        if output:
-            self.output_path.delete(0, tk.END)
-            self.output_path.insert(0, output)
+        o = filedialog.asksaveasfilename(defaultextension=".zip",
+                                          filetypes=[("ZIP", "*.zip"), ("所有", "*.*")])
+        if o: self.output_path.delete(0, tk.END); self.output_path.insert(0, o)
 
-    def _select_zip_file(self):
-        zf = filedialog.askopenfilename(title="选择ZIP文件",
-                                        filetypes=[("ZIP文件", "*.zip"), ("所有文件", "*.*")])
-        if zf:
-            self.zip_path.delete(0, tk.END)
-            self.zip_path.insert(0, zf)
+    def _add_zip_files(self):
+        files = filedialog.askopenfilenames(filetypes=[("ZIP", "*.zip"), ("所有", "*.*")])
+        if files:
+            for f in files:
+                if f not in self.zip_list.get(0, tk.END): self.zip_list.insert(tk.END, f)
+            self._update_extract_path()
+
+    def _remove_selected_zip(self):
+        for i in reversed(self.zip_list.curselection()): self.zip_list.delete(i)
+
+    def _clear_zip_list(self): self.zip_list.delete(0, tk.END)
 
     def _select_extract_dir(self):
         d = filedialog.askdirectory(title="选择解压目录")
-        if d:
-            self.extract_path.delete(0, tk.END)
-            self.extract_path.insert(0, d)
+        if d: self.extract_path.delete(0, tk.END); self.extract_path.insert(0, d)
 
-    # ============================================================
-    # 压缩/解压（子线程执行，UI更新通过root.after）
-    # ============================================================
+    # ---------- 压缩 ----------
     def _start_compression(self):
         files = self.file_list.get(0, tk.END)
         output = self.output_path.get()
-        if not files:
-            self._show_error("错误", "请先添加文件或文件夹")
-            return
-        if not output:
-            self._show_error("错误", "请选择输出文件")
-            return
-
-        self._set_button_state(self.compress_btn, tk.DISABLED)
-        self._add_log("🚀 开始压缩...")
-
-        def _progress(v):
-            self._update_progress(self.compress_progress, self.compress_status,
-                                  v, f"🔄 压缩中... {v}%")
-
-        def _thread():
+        if not files: self._show_error("错误", "请先添加文件"); return
+        if not output: self._show_error("错误", "请选择输出文件"); return
+        self._reset_cancel()
+        self._set_btn_state(self.compress_btn, tk.DISABLED)
+        self.compress_cancel_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.compress_status.config(text="压缩中...")
+        self.compress_pf.pack(fill=tk.X, pady=(8, 0))
+        self.compress_progress['value'] = 0
+        def _prog(v): self._update_progress(self.compress_progress, self.compress_status, v, f"压缩中 {v}%")
+        def _run():
             try:
-                success, message, password = self.zip_handler.compress_files(
-                    files, output, _progress)
-                self._update_progress(self.compress_progress, self.compress_status,
-                                      100, "✅ 压缩成功" if success else "❌ 压缩失败")
-                if success:
-                    self._add_log(f"🎉 {message}")
-                    if password:
-                        try:
-                            idx = self.password_manager.get_passwords().index(password) + 1
-                            self._add_log(f"🔑 使用密码索引: #{idx}")
-                        except:
-                            pass
-                    try:
-                        sz = os.path.getsize(output)
-                        self._add_log(f"📊 输出大小: {self._format_size(sz)}")
-                    except:
-                        pass
+                self._ensure_handler()
+                ok, msg, pw = self.zip_handler.compress_files(files, output, _prog, self._is_cancelled)
+                self._update_progress(self.compress_progress, self.compress_status, 100,
+                                      "✅ 完成" if ok else "❌ 失败")
+                if ok:
+                    self._add_log(f"🎉 {msg}")
+                    try: self._add_log(f"📊 {self._format_size(os.path.getsize(output))}")
+                    except Exception: pass
+                    self._play_done_sound()
+                    # 弹出打开目录按钮
+                    self.root.after(0, lambda: self._show_open_btn(output, 'compress'))
                 else:
-                    self._add_log(f"❌ {message}")
-                    self._show_error("压缩失败", message)
+                    self._add_log(f"{'⚠️' if '取消' in msg else '❌'} {msg}")
+                    if "取消" not in msg: self._show_error("失败", msg)
             except Exception as e:
-                self._add_log(f"❌ 压缩异常: {e}")
-                self._show_error("压缩异常", str(e))
+                self._add_log(f"❌ {e}"); self._show_error("异常", str(e))
             finally:
-                self._set_button_state(self.compress_btn, tk.NORMAL)
+                self._set_btn_state(self.compress_btn, tk.NORMAL)
+                self.root.after(0, self.compress_cancel_btn.pack_forget)
+        threading.Thread(target=_run, daemon=True).start()
 
-        threading.Thread(target=_thread, daemon=True).start()
+    def _show_open_btn(self, path, which):
+        """在操作栏显示「打开目录」按钮"""
+        try:
+            T = self.T
+            if which == 'compress':
+                parent = self.compress_status.master
+            else:
+                parent = self.decompress_status.master
+            for w in parent.winfo_children():
+                if getattr(w, '_open_btn', False): w.destroy()
+            btn = tk.Button(parent, text="📂 打开目录", bg=T['BTN_SEC_BG'], fg=T['TEXT'],
+                            relief='flat', bd=0, font=('Microsoft YaHei', 9), cursor='hand2',
+                            activebackground=T['BTN_SEC_HOVER'],
+                            command=lambda: self._open_output_folder(path))
+            btn._open_btn = True
+            btn.pack(side=tk.LEFT, padx=8)
+            btn.bind('<Enter>', lambda e: btn.config(bg=T['BTN_SEC_HOVER']))
+            btn.bind('<Leave>', lambda e: btn.config(bg=T['BTN_SEC_BG']))
+        except Exception: pass
 
+    # ---------- 解压 ----------
     def _start_decompression(self):
-        zip_file = self.zip_path.get()
-        extract_dir = self.extract_path.get()
-        if not zip_file:
-            self._show_error("错误", "请选择ZIP文件")
-            return
-        if not extract_dir:
-            self._show_error("错误", "请选择输出目录")
-            return
-
-        self._set_button_state(self.decompress_btn, tk.DISABLED)
-        self._add_log("🚀 开始解压...")
-
-        def _progress(v):
-            self._update_progress(self.decompress_progress, self.decompress_status,
-                                  v, f"🔄 解压中... {v}%")
-
-        def _thread():
-            try:
-                success, message, password = self.zip_handler.decompress_file(
-                    zip_file, extract_dir, _progress)
-                self._update_progress(self.decompress_progress, self.decompress_status,
-                                      100, "✅ 解压成功" if success else "❌ 解压失败")
-                if success:
-                    self._add_log(f"🎉 {message}")
-                    if password:
-                        try:
-                            idx = self.password_manager.get_passwords().index(password) + 1
-                            self._add_log(f"🔑 匹配密码索引: #{idx}")
-                        except:
-                            pass
-                    try:
-                        fc = sum(len(files) for _, _, files in os.walk(extract_dir))
-                        self._add_log(f"📊 成功解压: {fc}个文件")
-                    except:
-                        pass
-                else:
-                    self._add_log(f"❌ {message}")
-                    self._show_error("解压失败", message)
-            except Exception as e:
-                self._add_log(f"❌ 解压异常: {e}")
-                self._show_error("解压异常", str(e))
-            finally:
-                self._set_button_state(self.decompress_btn, tk.NORMAL)
-
-        threading.Thread(target=_thread, daemon=True).start()
+        zips = self.zip_list.get(0, tk.END)
+        out = self.extract_path.get()
+        if not zips: self._show_error("错误", "请先添加ZIP"); return
+        if not out: self._show_error("错误", "请选择输出目录"); return
+        self._reset_cancel()
+        self._set_btn_state(self.decompress_btn, tk.DISABLED)
+        self.decompress_cancel_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.decompress_status.config(text="解压中...")
+        self.decompress_pf.pack(fill=tk.X, pady=(8, 0))
+        self.decompress_progress['value'] = 0
+        def _prog(v): self._update_progress(self.decompress_progress, self.decompress_status, v, f"解压中 {v}%")
+        def _run():
+            ok_c = fail_c = 0; total = len(zips); last_output = None
+            for idx, zf in enumerate(zips):
+                if self._is_cancelled(): self._add_log("⛔ 已取消"); break
+                self._add_log(f"📦 [{idx+1}/{total}] {os.path.basename(zf)}")
+                od = os.path.join(out, os.path.splitext(os.path.basename(zf))[0]) if total > 1 else out
+                last_output = od
+                try:
+                    self._ensure_handler()
+                    ok, msg, _ = self.zip_handler.decompress_file(zf, od, _prog, self._is_cancelled)
+                    if ok: ok_c += 1; self._add_log(f"  ✅ {msg}")
+                    else: fail_c += 1; self._add_log(f"  {'⚠️' if '取消' in msg else '❌'} {msg}")
+                except Exception as e:
+                    fail_c += 1; self._add_log(f"  ❌ {e}")
+            self._update_progress(self.decompress_progress, self.decompress_status, 100, "✅ 完成")
+            self._add_log(f"📊 完成: 成功{ok_c} 失败{fail_c} 共{total}")
+            self._play_done_sound()
+            if last_output:
+                self.root.after(0, lambda: self._show_open_btn(last_output, 'decompress'))
+            self._set_btn_state(self.decompress_btn, tk.NORMAL)
+            self.root.after(0, self.decompress_cancel_btn.pack_forget)
+        threading.Thread(target=_run, daemon=True).start()
 
     def _clear_log(self):
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.delete(1.0, tk.END)
+        self.log_text.config(state=tk.NORMAL); self.log_text.delete(1.0, tk.END)
         self.log_text.config(state=tk.DISABLED)
-        self._add_log("🗑️ 日志已清空")
 
     def _copy_log(self):
         self.log_text.config(state=tk.NORMAL)
-        content = self.log_text.get(1.0, tk.END)
-        self.log_text.config(state=tk.DISABLED)
-        self.root.clipboard_clear()
-        self.root.clipboard_append(content)
-        self._add_log("📋 日志已复制到剪贴板")
+        self.root.clipboard_clear(); self.root.clipboard_append(self.log_text.get(1.0, tk.END))
+        self.log_text.config(state=tk.DISABLED); self._add_log("📋 已复制")
 
     @staticmethod
-    def _format_size(size):
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if size < 1024.0:
-                return f"{size:.2f} {unit}"
-            size /= 1024.0
-        return f"{size:.2f} PB"
+    def _format_size(s):
+        for u in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if s < 1024: return f"{s:.2f} {u}"
+            s /= 1024
+        return f"{s:.2f} PB"
 
-# ============================================================
-# 入口
-# ============================================================
+
 def main():
-    # 启动GUI前检查依赖
-    if _missing_deps and tk_available:
-        _root = tk.Tk()
-        _root.withdraw()
-        _msg = "缺少以下依赖，程序无法运行：\n\n"
-        for name, cmd in _missing_deps:
-            _msg += f"  • {name} → {cmd}\n"
-        _msg += "\n请安装后重新运行。"
-        messagebox.showerror("依赖缺失", _msg)
-        _root.destroy()
-        return
-    elif _missing_deps:
-        print("错误：缺少以下依赖：")
-        for name, cmd in _missing_deps:
-            print(f"  • {name} → {cmd}")
-        return
-
     if not tk_available:
-        print("错误: Tkinter不可用，请安装包含Tkinter的Python版本")
-        return
-
-    # ============================================================
-    # 检查是否使用占位密钥（安全性拦截）
-    # ============================================================
-    try:
-        # 用临时对象检测，不触发正常初始化
-        pm = _PyPasswordManager()
-        enc = _PyFileNameEncryptor()
-        if pm.password_seed == 0 or enc.master_password == "YOUR_SECRET_KEY_HERE":
-            if tk_available:
-                _root = tk.Tk()
-                _root.withdraw()
-                messagebox.showerror(
-                    "安全配置错误",
-                    "程序尚未配置安全密钥，无法运行。\n"
-                    "请创建 secret_config.py 并填入您自己的种子和密码。\n"
-                    "详情请参考源码说明。"
-                )
-                _root.destroy()
-            else:
-                print("错误：占位密钥未替换，请配置 secret_config.py")
-            sys.exit(1)
-    except Exception:
-        # 如果检测过程出错，为避免误伤，允许继续运行（但可能后续出错）
-        pass
-    # ============================================================
-
+        print("错误: Tkinter不可用"); return
     root = tk.Tk()
-    app = ModernMainWindow(root)
-    try:
-        root.option_add("*Font", "Microsoft YaHei 10")
-    except:
-        pass
+    ModernMainWindow(root)
     root.mainloop()
 
 if __name__ == "__main__":
