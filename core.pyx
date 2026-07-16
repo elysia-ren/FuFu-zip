@@ -46,7 +46,7 @@ cdef class PasswordManager:
             + string.digits
             + "!@#$%^&*()_+-=[]{}|;:,.<>?"
         )
-        seed = 293132843413430611711722818101810311111127
+        seed = 0
 
         # ---- 占位值检测 ----
         if seed == 0:
@@ -89,8 +89,8 @@ cdef class FileNameEncryptor:
 
     def __init__(self):
         # ---- 敏感参数：编译后以二进制形式存在 ----
-        cdef str master_pw = "builtin_file_encryption_key_2025_v9"
-        cdef bytes salt = b"fixed_salt_for_file_encryption_2025"
+        cdef str master_pw = "YOUR_SECRET_KEY_HERE"
+        cdef bytes salt = b"YOUR_SECRET_SALT_HERE"
 
         # ---- 占位值检测 ----
         if master_pw == "YOUR_SECRET_KEY_HERE" or salt == b"YOUR_SECRET_SALT_HERE":
